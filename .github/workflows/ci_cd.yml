@@ -1,0 +1,111 @@
+# CI/CD pipeline
+
+name: CI/CD
+
+on: 
+  push:
+    paths-ignore:
+      - CHANGELOG.md
+
+jobs:
+  ci_cd:
+    runs-on: ubuntu-latest
+    outputs:
+      is_release: ${{ steps.release_info.outputs.is_release }}
+      version: ${{ steps.version_info.outputs.version }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v1
+      with:
+        node-version: 10.x
+        registry-url: https://npm.pkg.github.com/
+        scope: '@dominikfoldi'
+
+    - name: Release Info
+      id: release_info
+      run: |
+        COMMIT_MESSAGE="${{ github.event.head_commit.message }}"
+        if [[ $COMMIT_MESSAGE == release:* ]] && [[ $GITHUB_REF =~ ^refs\/heads\/(master|[0-9]+?\.[0-9]+?\.x)$ ]]; \
+        then echo "::set-output name=is_release::true"; \
+        else echo "::set-output name=is_release::false"; \
+        fi
+
+    - name: Version Info
+      if: ${{ steps.release_info.outputs.is_release == 'true' }}
+      id: version_info
+      run: |
+        version=$(cat package.json | jq .version -r)
+        echo "::set-output name=version::$version"
+        if [[ $version =~ ^[0-9]+?\.[0-9]+?\.[0-9]+?$ ]]; then echo "::set-output name=is_prerelease::false"; else echo "::set-output name=is_prerelease::true"; fi
+
+    - name: Get the latest changelog
+      if: ${{ steps.release_info.outputs.is_release == 'true' }}
+      id: latest_changelog
+      run: |
+        changelog=$(node ./scripts/latest-changelog.js)
+        changelog="${changelog//'%'/'%25'}"
+        changelog="${changelog//$'\n'/'%0A'}"
+        changelog="${changelog//$'\r'/'%0D'}"
+        echo "::set-output name=changelog::$changelog"
+
+    - name: Create a GitHub Release
+      if: ${{ steps.release_info.outputs.is_release == 'true' }}
+      uses: ncipollo/release-action@v1
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        commit: ${{ github.sha }}
+        name: ${{ steps.version_info.outputs.version }}
+        tag: v${{ steps.version_info.outputs.version }}
+        body: ${{ steps.latest_changelog.outputs.changelog }}
+        artifacts: artifact.md
+        prerelease: ${{ steps.version_info.outputs.is_prerelease == 'true' }}
+
+  master_changelog:
+    runs-on: ubuntu-latest
+    needs: ci_cd
+    if: ${{ needs.ci_cd.outputs.is_release == 'true' && github.ref != 'ref/heads/master' }}
+    steps:
+      - name: Get the release branch name
+        id: release_branch
+        run: |
+          [[ $GITHUB_REF =~ ^refs\/heads\/(.*)$ ]]; echo "::set-output name=name::${BASH_REMATCH[1]}"
+
+      - name: Checkout the master branch
+        uses: actions/checkout@v2
+        with:
+          ref: 'master'
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v1
+        with:
+          node-version: 10.x
+
+      - name: Add the release changelog to master
+        run: node ./scripts/update-master-changelog.js ${{ steps.release_branch.outputs.name }}
+
+      - name: Create Pull Request with the updated changelog
+        uses: peter-evans/create-pull-request@v3
+        id: changelog_pr
+        with:
+          base: master
+          branch: github-actions/changelog-${{ needs.ci_cd.outputs.version }}
+          title: 'docs: release notes for the v${{ needs.ci_cd.outputs.version }} release'
+
+      - name: Automerge changelog update pull request
+        uses: maxkomarychev/oction-merge-pull-request@v0.7.1
+        with:
+          token: '${{ secrets.GITHUB_TOKEN }}'
+          pull_number: ${{ steps.changelog_pr.outputs.pull-request-number }}
+          merge_method: 'squash'
+          commit_title: 'docs: release notes for the v${{ needs.ci_cd.outputs.version }} release'
+          commit_message: ''
+
+      - name: Delete changelog update branch
+        uses: dawidd6/action-delete-branch@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          numbers: ${{ steps.changelog_pr.outputs.pull-request-number }}
